@@ -1,0 +1,24 @@
+name = "nas-warden-control-plane"
+main = "src/index.js"
+compatibility_date = "2026-03-13"
+workers_dev = true
+
+# Keep workers.dev available for first smoke tests, but point the NAS at the
+# custom domain once Cloudflare Access is in place.
+[[routes]]
+pattern = "control.1537396697323.xyz"
+custom_domain = true
+
+[vars]
+HEARTBEAT_WARN_MINUTES = "2"
+HEARTBEAT_STALE_MINUTES = "10"
+JOB_LEASE_MINUTES = "20"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nas-warden-control-plane"
+database_id = "REPLACE_WITH_REAL_D1_DATABASE_ID"
+
+# Set these with `wrangler secret put ...` in the real deployment:
+# CONTROL_PLANE_AGENT_TOKEN
+# ADMIN_API_TOKEN

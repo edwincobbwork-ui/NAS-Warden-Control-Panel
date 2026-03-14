@@ -1,0 +1,559 @@
+const JSON_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+  "cache-control": "no-store",
+};
+
+const CORS_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "authorization, content-type, x-nas-warden-agent-token",
+};
+
+const DEFAULT_HEARTBEAT_STALE_MINUTES = 10;
+const DEFAULT_HEARTBEAT_WARN_MINUTES = 2;
+const CLAIMABLE_JOB_STATUSES = ["queued", "waiting_for_nas", "retry_wait"];
+
+export default {
+  async fetch(request, env) {
+    try {
+      return await handleRequest(request, env);
+    } catch (error) {
+      return json(
+        {
+          ok: false,
+          error: "internal_error",
+          message: error instanceof Error ? error.message : String(error),
+        },
+        typeof error?.status === "number" ? error.status : 500,
+      );
+    }
+  },
+};
+
+async function handleRequest(request, env) {
+  const url = new URL(request.url);
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        ...CORS_HEADERS,
+      },
+    });
+  }
+
+  if (request.method === "GET" && url.pathname === "/healthz") {
+    return json({
+      ok: true,
+      service: "nas-warden-control-plane",
+      ts: new Date().toISOString(),
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/agent/heartbeat") {
+    requireAgentAuth(request, env);
+    const body = await request.json();
+    return json(await acceptHeartbeat(env, body));
+  }
+
+  if (request.method === "POST" && url.pathname === "/agent/jobs/claim") {
+    requireAgentAuth(request, env);
+    const body = await request.json();
+    return json(await claimJobs(env, body));
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/status/summary") {
+    requireAdminAuth(request, env);
+    return json(await statusSummary(env));
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/jobs") {
+    requireAdminAuth(request, env);
+    return json(await listJobs(env, url));
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/api/jobs/")) {
+    requireAdminAuth(request, env);
+    const jobId = decodeURIComponent(url.pathname.slice("/api/jobs/".length));
+    return json(await getJob(env, jobId));
+  }
+
+  if (request.method === "POST" && /^\/api\/approvals\/[^/]+\/approve$/.test(url.pathname)) {
+    requireAdminAuth(request, env);
+    const approvalId = decodeURIComponent(url.pathname.split("/")[3] || "");
+    return json(await resolveApproval(env, approvalId, true));
+  }
+
+  if (request.method === "POST" && /^\/api\/approvals\/[^/]+\/deny$/.test(url.pathname)) {
+    requireAdminAuth(request, env);
+    const approvalId = decodeURIComponent(url.pathname.split("/")[3] || "");
+    return json(await resolveApproval(env, approvalId, false));
+  }
+
+  return json(
+    {
+      ok: false,
+      error: "not_found",
+      path: url.pathname,
+    },
+    404,
+  );
+}
+
+async function acceptHeartbeat(env, body) {
+  const snapshot = body && typeof body === "object" ? body.snapshot : null;
+  if (!snapshot || typeof snapshot !== "object") {
+    throw httpError(400, "heartbeat payload must include a snapshot object");
+  }
+
+  const node = snapshot.node || {};
+  const nodeId = safeString(node.node_id);
+  if (!nodeId) {
+    throw httpError(400, "snapshot.node.node_id is required");
+  }
+
+  const now = new Date().toISOString();
+  const lastSeenAt = safeString(snapshot?.presence?.last_seen_at) || now;
+  const health = snapshot?.health || {};
+  const checks = Array.isArray(snapshot.checks) ? snapshot.checks : [];
+  const queue = snapshot?.queue || {};
+  const network = node.network || {};
+
+  await env.DB.prepare(
+    `INSERT INTO nas_nodes (
+       node_id, label, host_name, app_version, status, last_seen_at, tailscale_ip, lan_ip, capabilities_json, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET
+       label = excluded.label,
+       host_name = excluded.host_name,
+       app_version = excluded.app_version,
+       status = excluded.status,
+       last_seen_at = excluded.last_seen_at,
+       tailscale_ip = excluded.tailscale_ip,
+       lan_ip = excluded.lan_ip,
+       capabilities_json = excluded.capabilities_json,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      nodeId,
+      safeString(node.label) || nodeId,
+      safeString(node.label) || nodeId,
+      safeString(body?.app_version),
+      safeString(snapshot?.presence?.state) || "online",
+      lastSeenAt,
+      safeString(network.tailscale_ip),
+      safeString(network.lan_ip),
+      JSON.stringify(node.capabilities || {}),
+      now,
+    )
+    .run();
+
+  const heartbeatId = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO heartbeats (
+       id, node_id, ts, summary_status, queue_depth, checks_json, details_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      heartbeatId,
+      nodeId,
+      safeString(body.generated_at) || now,
+      safeString(health.overall) || "WARN",
+      totalQueueDepth(queue),
+      JSON.stringify(checks),
+      JSON.stringify({
+        queue,
+        services: snapshot.services || {},
+        storage: snapshot.storage || {},
+      }),
+    )
+    .run();
+
+  const checkStatements = checks.map((item) =>
+    env.DB.prepare(
+      `INSERT INTO service_checks (
+         id, node_id, check_name, status, summary, details_json, recorded_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      crypto.randomUUID(),
+      nodeId,
+      safeString(item.name),
+      safeString(item.status),
+      safeString(item.summary),
+      JSON.stringify(item.details || {}),
+      safeString(body.generated_at) || now,
+    ),
+  );
+  if (checkStatements.length) {
+    await env.DB.batch(checkStatements);
+  }
+
+  return {
+    ok: true,
+    node_id: nodeId,
+    received_at: now,
+    heartbeat_id: heartbeatId,
+    checks_recorded: checkStatements.length,
+  };
+}
+
+async function claimJobs(env, body) {
+  const nodeId = safeString(body?.node_id);
+  if (!nodeId) {
+    throw httpError(400, "node_id is required");
+  }
+  const limit = clampInteger(body?.limit, 1, 25, 5);
+  const now = new Date().toISOString();
+  const leaseTtlMinutes = clampInteger(env.JOB_LEASE_MINUTES, 1, 120, 20);
+  const leaseExpiresAt = new Date(Date.now() + leaseTtlMinutes * 60 * 1000).toISOString();
+
+  const statusPlaceholders = CLAIMABLE_JOB_STATUSES.map(() => "?").join(", ");
+  const { results } = await env.DB.prepare(
+    `SELECT job_id, job_type, workspace_slug, status, priority, source_object_key, source_local_path, target_path, params_json
+     FROM jobs
+     WHERE status IN (${statusPlaceholders})
+       AND (requires_approval = 0 OR approved_at != '')
+       AND (lease_expires_at = '' OR lease_expires_at < ?)
+     ORDER BY priority ASC, created_at ASC
+     LIMIT ?`
+  )
+    .bind(...CLAIMABLE_JOB_STATUSES, now, limit)
+    .all();
+
+  const claimed = [];
+  for (const row of results || []) {
+    const update = await env.DB.prepare(
+      `UPDATE jobs
+       SET status = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ?, attempt_count = attempt_count + 1
+       WHERE job_id = ?
+         AND status IN (${statusPlaceholders})
+         AND (lease_expires_at = '' OR lease_expires_at < ?)`
+    )
+      .bind(
+        "leased",
+        nodeId,
+        leaseExpiresAt,
+        now,
+        row.job_id,
+        ...CLAIMABLE_JOB_STATUSES,
+        now,
+      )
+      .run();
+
+    const changes = update?.meta?.changes || 0;
+    if (!changes) {
+      continue;
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO job_events (
+         id, job_id, ts, level, event_type, message, details_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        crypto.randomUUID(),
+        row.job_id,
+        now,
+        "INFO",
+        "leased",
+        `${nodeId} claimed job ${row.job_id}.`,
+        JSON.stringify({
+          lease_owner: nodeId,
+          lease_expires_at: leaseExpiresAt,
+        }),
+      )
+      .run();
+
+    claimed.push({
+      job_id: row.job_id,
+      job_type: row.job_type,
+      workspace_slug: row.workspace_slug,
+      status: "leased",
+      lease_owner: nodeId,
+      lease_expires_at: leaseExpiresAt,
+      source_object_key: row.source_object_key,
+      source_local_path: row.source_local_path,
+      target_path: row.target_path,
+      params: parseJson(row.params_json),
+    });
+  }
+
+  return {
+    ok: true,
+    node_id: nodeId,
+    claimed_count: claimed.length,
+    jobs: claimed,
+    generated_at: now,
+  };
+}
+
+async function statusSummary(env) {
+  const now = Date.now();
+  const staleMs = clampInteger(env.HEARTBEAT_STALE_MINUTES, 1, 120, DEFAULT_HEARTBEAT_STALE_MINUTES) * 60 * 1000;
+  const warnMs = clampInteger(env.HEARTBEAT_WARN_MINUTES, 1, 60, DEFAULT_HEARTBEAT_WARN_MINUTES) * 60 * 1000;
+
+  const nodesQuery = await env.DB.prepare(
+    `SELECT node_id, label, status, last_seen_at, tailscale_ip, lan_ip
+     FROM nas_nodes
+     ORDER BY label ASC`
+  ).all();
+  const jobCountsQuery = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS count
+     FROM jobs
+     GROUP BY status`
+  ).all();
+  const approvalCountsQuery = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS count
+     FROM approval_requests
+     GROUP BY status`
+  ).all();
+
+  const nodes = (nodesQuery.results || []).map((row) => {
+    const lastSeen = Date.parse(row.last_seen_at || "");
+    let derived = "offline";
+    if (!Number.isNaN(lastSeen)) {
+      const age = now - lastSeen;
+      if (age <= warnMs) {
+        derived = "online";
+      } else if (age <= staleMs) {
+        derived = "stale";
+      }
+    }
+    return {
+      node_id: row.node_id,
+      label: row.label,
+      status: derived,
+      last_seen_at: row.last_seen_at,
+      tailscale_ip: row.tailscale_ip,
+      lan_ip: row.lan_ip,
+    };
+  });
+
+  return {
+    ok: true,
+    generated_at: new Date().toISOString(),
+    nodes,
+    jobs: countRows(jobCountsQuery.results || []),
+    approvals: countRows(approvalCountsQuery.results || []),
+  };
+}
+
+async function listJobs(env, url) {
+  const status = url.searchParams.get("status") || "";
+  const limit = clampInteger(url.searchParams.get("limit"), 1, 200, 50);
+  const query = status
+    ? env.DB.prepare(
+        `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at
+         FROM jobs
+         WHERE status = ?
+         ORDER BY created_at DESC
+         LIMIT ?`
+      ).bind(status, limit)
+    : env.DB.prepare(
+        `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at
+         FROM jobs
+         ORDER BY created_at DESC
+         LIMIT ?`
+      ).bind(limit);
+  const { results } = await query.all();
+  return {
+    ok: true,
+    results: results || [],
+  };
+}
+
+async function getJob(env, jobId) {
+  if (!jobId) {
+    throw httpError(400, "job id is required");
+  }
+  const job = await env.DB.prepare(
+    `SELECT *
+     FROM jobs
+     WHERE job_id = ?
+     LIMIT 1`
+  )
+    .bind(jobId)
+    .first();
+  if (!job) {
+    throw httpError(404, "job not found");
+  }
+
+  const { results: events } = await env.DB.prepare(
+    `SELECT id, ts, level, event_type, message, details_json
+     FROM job_events
+     WHERE job_id = ?
+     ORDER BY ts DESC
+     LIMIT 50`
+  )
+    .bind(jobId)
+    .all();
+
+  return {
+    ok: true,
+    job: {
+      ...job,
+      params_json: parseJson(job.params_json),
+    },
+    events: (events || []).map((event) => ({
+      ...event,
+      details_json: parseJson(event.details_json),
+    })),
+  };
+}
+
+async function resolveApproval(env, approvalId, approved) {
+  if (!approvalId) {
+    throw httpError(400, "approval id is required");
+  }
+
+  const existing = await env.DB.prepare(
+    `SELECT approval_id, job_id, status
+     FROM approval_requests
+     WHERE approval_id = ?
+     LIMIT 1`
+  )
+    .bind(approvalId)
+    .first();
+  if (!existing) {
+    throw httpError(404, "approval not found");
+  }
+  if (existing.status !== "pending") {
+    throw httpError(409, `approval is already ${existing.status}`);
+  }
+
+  const now = new Date().toISOString();
+  const nextStatus = approved ? "approved" : "denied";
+  await env.DB.prepare(
+    `UPDATE approval_requests
+     SET status = ?, resolved_at = ?, resolved_by = ?
+     WHERE approval_id = ?`
+  )
+    .bind(nextStatus, now, "admin-api", approvalId)
+    .run();
+
+  if (existing.job_id) {
+    await env.DB.prepare(
+      `UPDATE jobs
+       SET status = ?, approved_at = ?, updated_at = ?, error_code = ?, error_message = ?
+       WHERE job_id = ?`
+    )
+      .bind(
+        approved ? "queued" : "cancelled",
+        approved ? now : "",
+        now,
+        approved ? "" : "approval_denied",
+        approved ? "" : "Approval was denied from the admin API.",
+        existing.job_id,
+      )
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO job_events (
+         id, job_id, ts, level, event_type, message, details_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        crypto.randomUUID(),
+        existing.job_id,
+        now,
+        "INFO",
+        approved ? "approval-approved" : "approval-denied",
+        approved ? `Approval ${approvalId} was approved.` : `Approval ${approvalId} was denied.`,
+        JSON.stringify({ approval_id: approvalId }),
+      )
+      .run();
+  }
+
+  return {
+    ok: true,
+    approval_id: approvalId,
+    status: nextStatus,
+    resolved_at: now,
+  };
+}
+
+function requireAgentAuth(request, env) {
+  const expected = safeString(env.CONTROL_PLANE_AGENT_TOKEN);
+  if (!expected) {
+    return;
+  }
+  const provided =
+    bearerToken(request.headers.get("authorization")) ||
+    safeString(request.headers.get("x-nas-warden-agent-token"));
+  if (!provided || provided !== expected) {
+    throw httpError(401, "agent authentication failed");
+  }
+}
+
+function requireAdminAuth(request, env) {
+  const expected = safeString(env.ADMIN_API_TOKEN);
+  if (!expected) {
+    return;
+  }
+  const provided = bearerToken(request.headers.get("authorization"));
+  if (!provided || provided !== expected) {
+    throw httpError(401, "admin authentication failed");
+  }
+}
+
+function bearerToken(value) {
+  const raw = safeString(value);
+  if (!raw.toLowerCase().startsWith("bearer ")) {
+    return "";
+  }
+  return raw.slice(7).trim();
+}
+
+function countRows(rows) {
+  const counts = {};
+  for (const row of rows) {
+    counts[safeString(row.status)] = Number(row.count || 0);
+  }
+  return counts;
+}
+
+function totalQueueDepth(queue) {
+  return (
+    Number(queue.pending_approvals || 0) +
+    Number(queue.approved_actions || 0) +
+    Number(queue.failed_actions || 0)
+  );
+}
+
+function parseJson(value) {
+  if (!value) {
+    return null;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function clampInteger(value, min, max, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (Number.isNaN(parsed)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function safeString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function json(payload, status = 200) {
+  return new Response(JSON.stringify(payload, null, 2) + "\n", {
+    status,
+    headers: {
+      ...JSON_HEADERS,
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
