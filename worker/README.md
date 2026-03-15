@@ -57,10 +57,45 @@ This Worker accepts those contracts and persists them in D1.
 ### Admin API routes
 
 - `GET /api/status/summary`
+- `POST /api/jobs`
 - `GET /api/jobs`
 - `GET /api/jobs/:jobId`
+- `GET /api/approvals`
 - `POST /api/approvals/:approvalId/approve`
 - `POST /api/approvals/:approvalId/deny`
+
+### Minimal admin write flow
+
+The Worker can now create queue rows directly through the admin API.
+
+Current safe write path:
+
+- `POST /api/jobs`
+  - creates a queued job
+  - optionally creates a pending approval request
+  - writes initial `job_events`
+
+Example request body:
+
+```json
+{
+  "job_type": "noop",
+  "workspace_slug": "production",
+  "requested_by": "admin-api",
+  "priority": 100,
+  "requires_approval": true,
+  "approval_reason": "Validate the approval gate before first real queue use.",
+  "target_path": "validation/noop.txt",
+  "params": {
+    "note": "first queue validation"
+  }
+}
+```
+
+Useful follow-up reads:
+
+- `GET /api/jobs`
+- `GET /api/approvals?status=pending`
 
 ## Auth Model
 
@@ -103,6 +138,7 @@ Current intentional simplifications:
 - no browser auth or UI yet
 - no upload-intent endpoint yet
 - no write-side admin UI yet
+- no agent callback for reporting remote job completion yet
 - no queue dead-letter handling yet
 - job leasing is optimistic rather than full transactionally locked orchestration
 
@@ -119,4 +155,5 @@ The next implementation step should be one of:
 
 - add `POST /api/uploads/create` and `POST /api/uploads/complete`
 - add `POST /api/archive/create`
+- add an agent callback for job completion / failure reporting
 - add a small admin front end on top of the existing routes

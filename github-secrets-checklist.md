@@ -98,8 +98,10 @@ This same value must exist:
 Used by admin/API clients to call:
 
 - `/api/status/summary`
+- `/api/jobs` `POST`
 - `/api/jobs`
 - `/api/jobs/:jobId`
+- `/api/approvals`
 - `/api/approvals/:approvalId/approve`
 - `/api/approvals/:approvalId/deny`
 

@@ -67,9 +67,20 @@ async function handleRequest(request, env) {
     return json(await statusSummary(env));
   }
 
+  if (request.method === "POST" && url.pathname === "/api/jobs") {
+    requireAdminAuth(request, env);
+    const body = await request.json();
+    return json(await createJob(env, body), 201);
+  }
+
   if (request.method === "GET" && url.pathname === "/api/jobs") {
     requireAdminAuth(request, env);
     return json(await listJobs(env, url));
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/approvals") {
+    requireAdminAuth(request, env);
+    return json(await listApprovals(env, url));
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/api/jobs/")) {
@@ -338,19 +349,172 @@ async function statusSummary(env) {
   };
 }
 
+async function createJob(env, body) {
+  const payload = requireObject(body, "job payload");
+  const now = new Date().toISOString();
+  const jobId = optionalToken(payload.job_id, "job_id", 128) || crypto.randomUUID();
+  const jobType = requiredToken(payload.job_type, "job_type", 64).toLowerCase();
+  const workspaceSlug = optionalToken(payload.workspace_slug, "workspace_slug", 80).toLowerCase();
+  const requestedBy = safeString(payload.requested_by) || "admin-api";
+  const priority = clampInteger(payload.priority, 1, 1000, 100);
+  const requiresApproval = booleanFlag(payload.requires_approval);
+  const params = requireObject(payload.params ?? {}, "params");
+  const sourceObjectKey = limitedString(payload.source_object_key, "source_object_key", 512);
+  const sourceLocalPath = limitedString(payload.source_local_path, "source_local_path", 1024);
+  const targetPath = limitedString(payload.target_path, "target_path", 1024);
+
+  const existing = await env.DB.prepare(
+    `SELECT job_id
+     FROM jobs
+     WHERE job_id = ?
+     LIMIT 1`
+  )
+    .bind(jobId)
+    .first();
+  if (existing) {
+    throw httpError(409, `job already exists: ${jobId}`);
+  }
+
+  const initialStatus = requiresApproval ? "waiting_for_approval" : "queued";
+  await env.DB.prepare(
+    `INSERT INTO jobs (
+       job_id, job_type, workspace_slug, status, priority, requested_by, source_object_key, source_local_path,
+       target_path, attempt_count, lease_owner, lease_expires_at, requires_approval, approved_at, completed_at,
+       error_code, error_message, params_json, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, '', '', '', '', ?, ?, ?)`
+  )
+    .bind(
+      jobId,
+      jobType,
+      workspaceSlug,
+      initialStatus,
+      priority,
+      requestedBy,
+      sourceObjectKey,
+      sourceLocalPath,
+      targetPath,
+      requiresApproval ? 1 : 0,
+      JSON.stringify(params),
+      now,
+      now,
+    )
+    .run();
+
+  await env.DB.prepare(
+    `INSERT INTO job_events (
+       id, job_id, ts, level, event_type, message, details_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      crypto.randomUUID(),
+      jobId,
+      now,
+      "INFO",
+      "created",
+      `Admin created job ${jobId}.`,
+      JSON.stringify({
+        job_type: jobType,
+        requested_by: requestedBy,
+        requires_approval: requiresApproval,
+      }),
+    )
+    .run();
+
+  let approval = null;
+  if (requiresApproval) {
+    const approvalId = crypto.randomUUID();
+    const actionType = optionalToken(payload.approval_action_type, "approval_action_type", 64) || "job_execution";
+    const reason = safeString(payload.approval_reason) || `Approval required before ${jobType} can run.`;
+    const context = {
+      job_id: jobId,
+      job_type: jobType,
+      workspace_slug: workspaceSlug,
+      target_path: targetPath,
+      params,
+      ...(requireObject(payload.approval_context ?? {}, "approval_context")),
+    };
+
+    await env.DB.prepare(
+      `INSERT INTO approval_requests (
+         approval_id, job_id, action_type, status, requested_at, resolved_at, requested_by, resolved_by, reason, context_json
+       ) VALUES (?, ?, ?, ?, ?, '', ?, '', ?, ?)`
+    )
+      .bind(
+        approvalId,
+        jobId,
+        actionType,
+        "pending",
+        now,
+        requestedBy,
+        reason,
+        JSON.stringify(context),
+      )
+      .run();
+
+    await env.DB.prepare(
+      `INSERT INTO job_events (
+         id, job_id, ts, level, event_type, message, details_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        crypto.randomUUID(),
+        jobId,
+        now,
+        "INFO",
+        "approval-requested",
+        `Approval ${approvalId} is pending for job ${jobId}.`,
+        JSON.stringify({
+          approval_id: approvalId,
+          action_type: actionType,
+        }),
+      )
+      .run();
+
+    approval = {
+      approval_id: approvalId,
+      action_type: actionType,
+      status: "pending",
+      requested_at: now,
+      reason,
+    };
+  }
+
+  return {
+    ok: true,
+    job: {
+      job_id: jobId,
+      job_type: jobType,
+      workspace_slug: workspaceSlug,
+      status: initialStatus,
+      priority,
+      requested_by: requestedBy,
+      requires_approval: requiresApproval,
+      source_object_key: sourceObjectKey,
+      source_local_path: sourceLocalPath,
+      target_path: targetPath,
+      params,
+      created_at: now,
+      updated_at: now,
+    },
+    approval,
+  };
+}
+
 async function listJobs(env, url) {
   const status = url.searchParams.get("status") || "";
   const limit = clampInteger(url.searchParams.get("limit"), 1, 200, 50);
   const query = status
     ? env.DB.prepare(
-        `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at
+        `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at,
+                requires_approval, approved_at
          FROM jobs
          WHERE status = ?
          ORDER BY created_at DESC
          LIMIT ?`
       ).bind(status, limit)
     : env.DB.prepare(
-        `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at
+        `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at,
+                requires_approval, approved_at
          FROM jobs
          ORDER BY created_at DESC
          LIMIT ?`
@@ -359,6 +523,33 @@ async function listJobs(env, url) {
   return {
     ok: true,
     results: results || [],
+  };
+}
+
+async function listApprovals(env, url) {
+  const status = optionalToken(url.searchParams.get("status"), "status", 64);
+  const limit = clampInteger(url.searchParams.get("limit"), 1, 200, 50);
+  const query = status
+    ? env.DB.prepare(
+        `SELECT approval_id, job_id, action_type, status, requested_at, resolved_at, requested_by, resolved_by, reason, context_json
+         FROM approval_requests
+         WHERE status = ?
+         ORDER BY requested_at DESC
+         LIMIT ?`
+      ).bind(status, limit)
+    : env.DB.prepare(
+        `SELECT approval_id, job_id, action_type, status, requested_at, resolved_at, requested_by, resolved_by, reason, context_json
+         FROM approval_requests
+         ORDER BY requested_at DESC
+         LIMIT ?`
+      ).bind(limit);
+  const { results } = await query.all();
+  return {
+    ok: true,
+    results: (results || []).map((item) => ({
+      ...item,
+      context_json: parseJson(item.context_json),
+    })),
   };
 }
 
@@ -511,6 +702,14 @@ function countRows(rows) {
   return counts;
 }
 
+function booleanFlag(value) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  const raw = safeString(value).toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 function totalQueueDepth(queue) {
   return (
     Number(queue.pending_approvals || 0) +
@@ -536,6 +735,43 @@ function clampInteger(value, min, max, fallback) {
     return fallback;
   }
   return Math.max(min, Math.min(max, parsed));
+}
+
+function requireObject(value, fieldName) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw httpError(400, `${fieldName} must be an object`);
+  }
+  return value;
+}
+
+function requiredToken(value, fieldName, maxLength = 64) {
+  const raw = optionalToken(value, fieldName, maxLength);
+  if (!raw) {
+    throw httpError(400, `${fieldName} is required`);
+  }
+  return raw;
+}
+
+function optionalToken(value, fieldName, maxLength = 64) {
+  const raw = safeString(value);
+  if (!raw) {
+    return "";
+  }
+  if (raw.length > maxLength) {
+    throw httpError(400, `${fieldName} is too long`);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(raw)) {
+    throw httpError(400, `${fieldName} contains unsupported characters`);
+  }
+  return raw;
+}
+
+function limitedString(value, fieldName, maxLength) {
+  const raw = safeString(value);
+  if (raw.length > maxLength) {
+    throw httpError(400, `${fieldName} is too long`);
+  }
+  return raw;
 }
 
 function safeString(value) {

@@ -3,3 +3,4 @@
 .dev.vars.*
 .env
 .env.*
+wrangler.toml.bak
