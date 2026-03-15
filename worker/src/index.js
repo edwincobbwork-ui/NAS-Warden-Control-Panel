@@ -9,8 +9,8 @@ const CORS_HEADERS = {
   "access-control-allow-headers": "authorization, content-type, x-nas-warden-agent-token",
 };
 
-const DEFAULT_HEARTBEAT_STALE_MINUTES = 10;
-const DEFAULT_HEARTBEAT_WARN_MINUTES = 2;
+const DEFAULT_HEARTBEAT_STALE_MINUTES = 120;
+const DEFAULT_HEARTBEAT_WARN_MINUTES = 60;
 const CLAIMABLE_JOB_STATUSES = ["queued", "waiting_for_nas", "retry_wait"];
 
 export default {
@@ -124,7 +124,7 @@ async function acceptHeartbeat(env, body) {
   }
 
   const now = new Date().toISOString();
-  const lastSeenAt = safeString(snapshot?.presence?.last_seen_at) || now;
+  const reportedSeenAt = safeString(snapshot?.presence?.last_seen_at) || now;
   const health = snapshot?.health || {};
   const checks = Array.isArray(snapshot.checks) ? snapshot.checks : [];
   const queue = snapshot?.queue || {};
@@ -151,7 +151,7 @@ async function acceptHeartbeat(env, body) {
       safeString(node.label) || nodeId,
       safeString(body?.app_version),
       safeString(snapshot?.presence?.state) || "online",
-      lastSeenAt,
+      now,
       safeString(network.tailscale_ip),
       safeString(network.lan_ip),
       JSON.stringify(node.capabilities || {}),
@@ -173,6 +173,11 @@ async function acceptHeartbeat(env, body) {
       totalQueueDepth(queue),
       JSON.stringify(checks),
       JSON.stringify({
+        presence: {
+          state: safeString(snapshot?.presence?.state) || "online",
+          reported_last_seen_at: reportedSeenAt,
+          received_at: now,
+        },
         queue,
         services: snapshot.services || {},
         storage: snapshot.storage || {},

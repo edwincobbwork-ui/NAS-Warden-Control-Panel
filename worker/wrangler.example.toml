@@ -10,8 +10,8 @@ pattern = "control.1537396697323.xyz"
 custom_domain = true
 
 [vars]
-HEARTBEAT_WARN_MINUTES = "2"
-HEARTBEAT_STALE_MINUTES = "10"
+HEARTBEAT_WARN_MINUTES = "60"
+HEARTBEAT_STALE_MINUTES = "120"
 JOB_LEASE_MINUTES = "20"
 
 [[d1_databases]]

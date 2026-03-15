@@ -97,6 +97,14 @@ Useful follow-up reads:
 - `GET /api/jobs`
 - `GET /api/approvals?status=pending`
 
+Heartbeat freshness defaults are now tuned for the current NAS cadence:
+
+- warn after `60` minutes
+- stale after `120` minutes
+
+That matches the current `com.naslocal.warden` 45-minute LaunchAgent schedule
+more closely than the earlier 2-minute / 10-minute defaults.
+
 ## Auth Model
 
 Two independent secrets are expected:

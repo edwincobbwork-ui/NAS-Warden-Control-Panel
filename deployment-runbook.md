@@ -128,8 +128,8 @@ main = "src/index.js"
 compatibility_date = "2026-03-13"
 
 [vars]
-HEARTBEAT_WARN_MINUTES = "2"
-HEARTBEAT_STALE_MINUTES = "10"
+HEARTBEAT_WARN_MINUTES = "60"
+HEARTBEAT_STALE_MINUTES = "120"
 JOB_LEASE_MINUTES = "20"
 
 [[d1_databases]]
@@ -141,6 +141,12 @@ database_id = "PASTE_THE_REAL_DATABASE_ID_HERE"
 Keep the prepared custom-domain route in place for:
 
 - `control.1537396697323.xyz`
+
+Why those defaults:
+
+- the NAS `com.naslocal.warden` LaunchAgent runs every 45 minutes
+- the control-plane defaults should therefore not mark the node stale after only
+  2 or 10 minutes under normal operation
 
 Reference:
 
