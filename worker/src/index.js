@@ -12,6 +12,7 @@ const CORS_HEADERS = {
 const DEFAULT_HEARTBEAT_STALE_MINUTES = 120;
 const DEFAULT_HEARTBEAT_WARN_MINUTES = 60;
 const CLAIMABLE_JOB_STATUSES = ["queued", "waiting_for_nas", "retry_wait"];
+const REPORTABLE_JOB_STATUSES = ["completed", "failed", "retry_wait", "cancelled"];
 
 export default {
   async fetch(request, env) {
@@ -60,6 +61,13 @@ async function handleRequest(request, env) {
     requireAgentAuth(request, env);
     const body = await request.json();
     return json(await claimJobs(env, body));
+  }
+
+  if (request.method === "POST" && /^\/agent\/jobs\/[^/]+\/result$/.test(url.pathname)) {
+    requireAgentAuth(request, env);
+    const body = await request.json();
+    const jobId = decodeURIComponent(url.pathname.split("/")[3] || "");
+    return json(await reportJobResult(env, jobId, body));
   }
 
   if (request.method === "GET" && url.pathname === "/api/status/summary") {
@@ -300,6 +308,137 @@ async function claimJobs(env, body) {
     claimed_count: claimed.length,
     jobs: claimed,
     generated_at: now,
+  };
+}
+
+async function reportJobResult(env, jobId, body) {
+  if (!jobId) {
+    throw httpError(400, "job id is required");
+  }
+
+  const payload = requireObject(body, "job result payload");
+  const nodeId = requiredToken(payload.node_id, "node_id", 128);
+  const nextStatus = requiredToken(payload.status, "status", 32).toLowerCase();
+  if (!REPORTABLE_JOB_STATUSES.includes(nextStatus)) {
+    throw httpError(400, `unsupported job result status: ${nextStatus}`);
+  }
+
+  const message = limitedString(payload.message, "message", 1024);
+  const errorCode = optionalToken(payload.error_code, "error_code", 128);
+  const errorMessage = limitedString(payload.error_message, "error_message", 1024);
+  const details = requireObject(payload.details ?? {}, "details");
+  const retryDelayMinutes = clampInteger(payload.retry_delay_minutes, 1, 1440, 15);
+  const now = new Date().toISOString();
+
+  const existing = await env.DB.prepare(
+    `SELECT job_id, status, lease_owner, lease_expires_at, attempt_count
+     FROM jobs
+     WHERE job_id = ?
+     LIMIT 1`
+  )
+    .bind(jobId)
+    .first();
+  if (!existing) {
+    throw httpError(404, "job not found");
+  }
+  if (safeString(existing.status) !== "leased") {
+    throw httpError(409, `job ${jobId} is ${safeString(existing.status) || "not leased"}`);
+  }
+  if (safeString(existing.lease_owner) !== nodeId) {
+    throw httpError(409, `job ${jobId} is leased to ${safeString(existing.lease_owner) || "another node"}`);
+  }
+
+  let completedAt = "";
+  let leaseExpiresAt = "";
+  let nextErrorCode = errorCode;
+  let nextErrorMessage = errorMessage;
+  let eventLevel = "INFO";
+  let eventType = nextStatus;
+  let eventMessage = message;
+
+  if (nextStatus === "completed") {
+    completedAt = now;
+    nextErrorCode = "";
+    nextErrorMessage = "";
+    eventMessage = eventMessage || `${nodeId} completed job ${jobId}.`;
+  } else if (nextStatus === "failed") {
+    completedAt = now;
+    nextErrorCode = nextErrorCode || "job_failed";
+    nextErrorMessage = nextErrorMessage || eventMessage || `Job ${jobId} failed on ${nodeId}.`;
+    eventLevel = "ERROR";
+    eventMessage = eventMessage || `${nodeId} reported job ${jobId} as failed.`;
+  } else if (nextStatus === "cancelled") {
+    completedAt = now;
+    nextErrorCode = nextErrorCode || "job_cancelled";
+    nextErrorMessage = nextErrorMessage || eventMessage || `Job ${jobId} was cancelled by ${nodeId}.`;
+    eventLevel = "WARN";
+    eventMessage = eventMessage || `${nodeId} cancelled job ${jobId}.`;
+  } else if (nextStatus === "retry_wait") {
+    leaseExpiresAt = new Date(Date.now() + retryDelayMinutes * 60 * 1000).toISOString();
+    nextErrorCode = nextErrorCode || "retry_wait";
+    nextErrorMessage = nextErrorMessage || eventMessage || `Job ${jobId} will retry after backoff.`;
+    eventLevel = "WARN";
+    eventType = "retry-wait";
+    eventMessage = eventMessage || `${nodeId} returned job ${jobId} to retry_wait.`;
+  }
+
+  const update = await env.DB.prepare(
+    `UPDATE jobs
+     SET status = ?, lease_owner = '', lease_expires_at = ?, completed_at = ?, error_code = ?, error_message = ?, updated_at = ?
+     WHERE job_id = ?
+       AND status = 'leased'
+       AND lease_owner = ?`
+  )
+    .bind(
+      nextStatus,
+      leaseExpiresAt,
+      completedAt,
+      nextErrorCode,
+      nextErrorMessage,
+      now,
+      jobId,
+      nodeId,
+    )
+    .run();
+  if (!(update?.meta?.changes || 0)) {
+    throw httpError(409, `job ${jobId} is no longer leased to ${nodeId}`);
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO job_events (
+       id, job_id, ts, level, event_type, message, details_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      crypto.randomUUID(),
+      jobId,
+      now,
+      eventLevel,
+      eventType,
+      eventMessage,
+      JSON.stringify({
+        node_id: nodeId,
+        prior_status: safeString(existing.status),
+        attempt_count: Number(existing.attempt_count || 0),
+        retry_delay_minutes: nextStatus === "retry_wait" ? retryDelayMinutes : 0,
+        retry_available_at: leaseExpiresAt,
+        error_code: nextErrorCode,
+        error_message: nextErrorMessage,
+        ...details,
+      }),
+    )
+    .run();
+
+  return {
+    ok: true,
+    job_id: jobId,
+    node_id: nodeId,
+    status: nextStatus,
+    updated_at: now,
+    lease_expires_at: leaseExpiresAt,
+    completed_at: completedAt,
+    error_code: nextErrorCode,
+    error_message: nextErrorMessage,
   };
 }
 

@@ -87,6 +87,7 @@ Used by the NAS worker agent when posting:
 
 - `/agent/heartbeat`
 - `/agent/jobs/claim`
+- `/agent/jobs/:jobId/result`
 
 This same value must exist:
 

@@ -175,6 +175,7 @@ Change:
   "base_url": "",
   "heartbeat_endpoint": "/agent/heartbeat",
   "claim_jobs_endpoint": "/agent/jobs/claim",
+  "report_job_result_endpoint": "/agent/jobs/{job_id}/result",
   "timeout_seconds": 15,
   "claim_limit": 5,
   "auth_type": "bearer",
@@ -190,6 +191,7 @@ To:
   "base_url": "https://control.1537396697323.xyz",
   "heartbeat_endpoint": "/agent/heartbeat",
   "claim_jobs_endpoint": "/agent/jobs/claim",
+  "report_job_result_endpoint": "/agent/jobs/{job_id}/result",
   "timeout_seconds": 15,
   "claim_limit": 5,
   "auth_type": "bearer",
@@ -211,6 +213,11 @@ PYTHONPATH=src /usr/local/bin/python3 -m nas_warden_v2.cli control-plane-status
 PYTHONPATH=src /usr/local/bin/python3 -m nas_warden_v2.cli send-control-plane-heartbeat --dry-run
 
 PYTHONPATH=src /usr/local/bin/python3 -m nas_warden_v2.cli send-control-plane-heartbeat
+
+PYTHONPATH=src /usr/local/bin/python3 -m nas_warden_v2.cli report-control-plane-job-result test-job \
+  --status completed \
+  --details-json '{"note":"validation"}' \
+  --dry-run
 
 PYTHONPATH=src /usr/local/bin/python3 -m nas_warden_v2.cli run-cycle
 ```

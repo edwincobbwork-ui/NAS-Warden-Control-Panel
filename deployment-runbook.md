@@ -311,6 +311,7 @@ Change:
   "base_url": "",
   "heartbeat_endpoint": "/agent/heartbeat",
   "claim_jobs_endpoint": "/agent/jobs/claim",
+  "report_job_result_endpoint": "/agent/jobs/{job_id}/result",
   "timeout_seconds": 15,
   "claim_limit": 5,
   "auth_type": "bearer",
@@ -326,6 +327,7 @@ To:
   "base_url": "https://control.1537396697323.xyz",
   "heartbeat_endpoint": "/agent/heartbeat",
   "claim_jobs_endpoint": "/agent/jobs/claim",
+  "report_job_result_endpoint": "/agent/jobs/{job_id}/result",
   "timeout_seconds": 15,
   "claim_limit": 5,
   "auth_type": "bearer",
@@ -371,6 +373,16 @@ Optional claim dry-run:
 ```bash
 cd /Users/nasstoragesystem/ops/nas_warden_v2
 PYTHONPATH=src /usr/local/bin/python3 -m nas_warden_v2.cli claim-control-plane-jobs --dry-run
+```
+
+Optional result-report dry-run:
+
+```bash
+cd /Users/nasstoragesystem/ops/nas_warden_v2
+PYTHONPATH=src /usr/local/bin/python3 -m nas_warden_v2.cli report-control-plane-job-result test-job \
+  --status completed \
+  --details-json '{"note":"validation"}' \
+  --dry-run
 ```
 
 Then run one real cycle:

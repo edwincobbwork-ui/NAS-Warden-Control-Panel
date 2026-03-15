@@ -54,6 +54,11 @@ This Worker accepts those contracts and persists them in D1.
   - marks them `leased`
   - writes `job_events`
 
+- `POST /agent/jobs/:jobId/result`
+  - accepts `completed`, `failed`, `cancelled`, or `retry_wait`
+  - verifies the reporting NAS still owns the lease
+  - clears or defers the lease and writes `job_events`
+
 ### Admin API routes
 
 - `GET /api/status/summary`
@@ -146,7 +151,6 @@ Current intentional simplifications:
 - no browser auth or UI yet
 - no upload-intent endpoint yet
 - no write-side admin UI yet
-- no agent callback for reporting remote job completion yet
 - no queue dead-letter handling yet
 - job leasing is optimistic rather than full transactionally locked orchestration
 
@@ -156,6 +160,7 @@ Those are acceptable for the current milestone because the goal here is to estab
 - the persistence model
 - the node heartbeat path
 - the claimable-job API shape
+- the leased-job completion / retry contract
 
 ## Expected Next Step
 
@@ -163,5 +168,5 @@ The next implementation step should be one of:
 
 - add `POST /api/uploads/create` and `POST /api/uploads/complete`
 - add `POST /api/archive/create`
-- add an agent callback for job completion / failure reporting
 - add a small admin front end on top of the existing routes
+- add queue dead-letter or retry budget handling
