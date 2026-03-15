@@ -11,6 +11,7 @@ const CORS_HEADERS = {
 
 const DEFAULT_HEARTBEAT_STALE_MINUTES = 120;
 const DEFAULT_HEARTBEAT_WARN_MINUTES = 60;
+const DEFAULT_JOB_MAX_ATTEMPTS = 3;
 const CLAIMABLE_JOB_STATUSES = ["queued", "waiting_for_nas", "retry_wait"];
 const REPORTABLE_JOB_STATUSES = ["completed", "failed", "retry_wait", "cancelled"];
 
@@ -84,6 +85,13 @@ async function handleRequest(request, env) {
   if (request.method === "GET" && url.pathname === "/api/jobs") {
     requireAdminAuth(request, env);
     return json(await listJobs(env, url));
+  }
+
+  if (request.method === "POST" && /^\/api\/jobs\/[^/]+\/requeue$/.test(url.pathname)) {
+    requireAdminAuth(request, env);
+    const body = await optionalJsonBody(request);
+    const jobId = decodeURIComponent(url.pathname.split("/")[3] || "");
+    return json(await requeueJob(env, jobId, body));
   }
 
   if (request.method === "GET" && url.pathname === "/api/approvals") {
@@ -331,7 +339,7 @@ async function reportJobResult(env, jobId, body) {
   const now = new Date().toISOString();
 
   const existing = await env.DB.prepare(
-    `SELECT job_id, status, lease_owner, lease_expires_at, attempt_count
+    `SELECT job_id, status, lease_owner, lease_expires_at, attempt_count, params_json
      FROM jobs
      WHERE job_id = ?
      LIMIT 1`
@@ -348,6 +356,8 @@ async function reportJobResult(env, jobId, body) {
     throw httpError(409, `job ${jobId} is leased to ${safeString(existing.lease_owner) || "another node"}`);
   }
 
+  const maxAttempts = jobMaxAttempts(existing.params_json);
+
   let completedAt = "";
   let leaseExpiresAt = "";
   let nextErrorCode = errorCode;
@@ -355,6 +365,7 @@ async function reportJobResult(env, jobId, body) {
   let eventLevel = "INFO";
   let eventType = nextStatus;
   let eventMessage = message;
+  let finalStatus = nextStatus;
 
   if (nextStatus === "completed") {
     completedAt = now;
@@ -374,12 +385,23 @@ async function reportJobResult(env, jobId, body) {
     eventLevel = "WARN";
     eventMessage = eventMessage || `${nodeId} cancelled job ${jobId}.`;
   } else if (nextStatus === "retry_wait") {
-    leaseExpiresAt = new Date(Date.now() + retryDelayMinutes * 60 * 1000).toISOString();
-    nextErrorCode = nextErrorCode || "retry_wait";
-    nextErrorMessage = nextErrorMessage || eventMessage || `Job ${jobId} will retry after backoff.`;
-    eventLevel = "WARN";
-    eventType = "retry-wait";
-    eventMessage = eventMessage || `${nodeId} returned job ${jobId} to retry_wait.`;
+    if (Number(existing.attempt_count || 0) >= maxAttempts) {
+      finalStatus = "dead_letter";
+      completedAt = now;
+      nextErrorCode = nextErrorCode || "retry_budget_exhausted";
+      nextErrorMessage =
+        nextErrorMessage || eventMessage || `Job ${jobId} exhausted its retry budget after ${maxAttempts} attempt(s).`;
+      eventLevel = "ERROR";
+      eventType = "dead-lettered";
+      eventMessage = eventMessage || `${nodeId} exhausted retry budget for job ${jobId}.`;
+    } else {
+      leaseExpiresAt = new Date(Date.now() + retryDelayMinutes * 60 * 1000).toISOString();
+      nextErrorCode = nextErrorCode || "retry_wait";
+      nextErrorMessage = nextErrorMessage || eventMessage || `Job ${jobId} will retry after backoff.`;
+      eventLevel = "WARN";
+      eventType = "retry-wait";
+      eventMessage = eventMessage || `${nodeId} returned job ${jobId} to retry_wait.`;
+    }
   }
 
   const update = await env.DB.prepare(
@@ -390,7 +412,7 @@ async function reportJobResult(env, jobId, body) {
        AND lease_owner = ?`
   )
     .bind(
-      nextStatus,
+      finalStatus,
       leaseExpiresAt,
       completedAt,
       nextErrorCode,
@@ -420,8 +442,10 @@ async function reportJobResult(env, jobId, body) {
         node_id: nodeId,
         prior_status: safeString(existing.status),
         attempt_count: Number(existing.attempt_count || 0),
+        max_attempts: maxAttempts,
         retry_delay_minutes: nextStatus === "retry_wait" ? retryDelayMinutes : 0,
         retry_available_at: leaseExpiresAt,
+        resulting_status: finalStatus,
         error_code: nextErrorCode,
         error_message: nextErrorMessage,
         ...details,
@@ -433,12 +457,13 @@ async function reportJobResult(env, jobId, body) {
     ok: true,
     job_id: jobId,
     node_id: nodeId,
-    status: nextStatus,
+    status: finalStatus,
     updated_at: now,
     lease_expires_at: leaseExpiresAt,
     completed_at: completedAt,
     error_code: nextErrorCode,
     error_message: nextErrorMessage,
+    max_attempts: maxAttempts,
   };
 }
 
@@ -502,7 +527,13 @@ async function createJob(env, body) {
   const requestedBy = safeString(payload.requested_by) || "admin-api";
   const priority = clampInteger(payload.priority, 1, 1000, 100);
   const requiresApproval = booleanFlag(payload.requires_approval);
-  const params = requireObject(payload.params ?? {}, "params");
+  const params = withJobControlPlaneMeta(
+    requireObject(payload.params ?? {}, "params"),
+    {
+      max_attempts: clampInteger(payload.max_attempts, 1, 20, DEFAULT_JOB_MAX_ATTEMPTS),
+    },
+  );
+  const maxAttempts = jobMaxAttempts(params);
   const sourceObjectKey = limitedString(payload.source_object_key, "source_object_key", 512);
   const sourceLocalPath = limitedString(payload.source_local_path, "source_local_path", 1024);
   const targetPath = limitedString(payload.target_path, "target_path", 1024);
@@ -560,6 +591,7 @@ async function createJob(env, body) {
         job_type: jobType,
         requested_by: requestedBy,
         requires_approval: requiresApproval,
+        max_attempts: maxAttempts,
       }),
     )
     .run();
@@ -633,6 +665,7 @@ async function createJob(env, body) {
       priority,
       requested_by: requestedBy,
       requires_approval: requiresApproval,
+      max_attempts: maxAttempts,
       source_object_key: sourceObjectKey,
       source_local_path: sourceLocalPath,
       target_path: targetPath,
@@ -650,7 +683,7 @@ async function listJobs(env, url) {
   const query = status
     ? env.DB.prepare(
         `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at,
-                requires_approval, approved_at
+                requires_approval, approved_at, params_json
          FROM jobs
          WHERE status = ?
          ORDER BY created_at DESC
@@ -658,7 +691,7 @@ async function listJobs(env, url) {
       ).bind(status, limit)
     : env.DB.prepare(
         `SELECT job_id, job_type, workspace_slug, status, priority, requested_by, created_at, updated_at, lease_owner, lease_expires_at,
-                requires_approval, approved_at
+                requires_approval, approved_at, params_json
          FROM jobs
          ORDER BY created_at DESC
          LIMIT ?`
@@ -666,7 +699,10 @@ async function listJobs(env, url) {
   const { results } = await query.all();
   return {
     ok: true,
-    results: results || [],
+    results: (results || []).map((item) => ({
+      ...item,
+      max_attempts: jobMaxAttempts(item.params_json),
+    })),
   };
 }
 
@@ -727,12 +763,90 @@ async function getJob(env, jobId) {
     ok: true,
     job: {
       ...job,
+      max_attempts: jobMaxAttempts(job.params_json),
       params_json: parseJson(job.params_json),
     },
     events: (events || []).map((event) => ({
       ...event,
       details_json: parseJson(event.details_json),
     })),
+  };
+}
+
+async function requeueJob(env, jobId, body) {
+  if (!jobId) {
+    throw httpError(400, "job id is required");
+  }
+
+  const payload = requireObject(body ?? {}, "requeue payload");
+  const resetAttemptCount = payload.reset_attempt_count !== false;
+  const priority = payload.priority == null ? null : clampInteger(payload.priority, 1, 1000, 100);
+  const now = new Date().toISOString();
+
+  const existing = await env.DB.prepare(
+    `SELECT job_id, status, requires_approval, approved_at, priority, attempt_count
+     FROM jobs
+     WHERE job_id = ?
+     LIMIT 1`
+  )
+    .bind(jobId)
+    .first();
+  if (!existing) {
+    throw httpError(404, "job not found");
+  }
+  if (safeString(existing.status) === "leased") {
+    throw httpError(409, "cannot requeue a job that is currently leased");
+  }
+  if (Number(existing.requires_approval || 0) && !safeString(existing.approved_at)) {
+    throw httpError(409, "cannot requeue an unapproved job; create a new approval request instead");
+  }
+
+  const nextStatus = "queued";
+  const nextPriority = priority == null ? Number(existing.priority || 100) : priority;
+
+  await env.DB.prepare(
+    `UPDATE jobs
+     SET status = ?, priority = ?, attempt_count = ?, lease_owner = '', lease_expires_at = '', completed_at = '',
+         error_code = '', error_message = '', updated_at = ?
+     WHERE job_id = ?`
+  )
+    .bind(
+      nextStatus,
+      nextPriority,
+      resetAttemptCount ? 0 : Number(existing.attempt_count || 0),
+      now,
+      jobId,
+    )
+    .run();
+
+  await env.DB.prepare(
+    `INSERT INTO job_events (
+       id, job_id, ts, level, event_type, message, details_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      crypto.randomUUID(),
+      jobId,
+      now,
+      "INFO",
+      "requeued",
+      `Admin requeued job ${jobId}.`,
+      JSON.stringify({
+        prior_status: safeString(existing.status),
+        next_status: nextStatus,
+        priority: nextPriority,
+        reset_attempt_count: resetAttemptCount,
+      }),
+    )
+    .run();
+
+  return {
+    ok: true,
+    job_id: jobId,
+    status: nextStatus,
+    priority: nextPriority,
+    reset_attempt_count: resetAttemptCount,
+    updated_at: now,
   };
 }
 
@@ -873,6 +987,21 @@ function parseJson(value) {
   }
 }
 
+function optionalJsonBody(request) {
+  return request
+    .text()
+    .then((raw) => {
+      if (!raw.trim()) {
+        return {};
+      }
+      const parsed = JSON.parse(raw);
+      return parsed == null ? {} : parsed;
+    })
+    .catch((error) => {
+      throw httpError(400, `invalid json body: ${error instanceof Error ? error.message : String(error)}`);
+    });
+}
+
 function clampInteger(value, min, max, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (Number.isNaN(parsed)) {
@@ -886,6 +1015,22 @@ function requireObject(value, fieldName) {
     throw httpError(400, `${fieldName} must be an object`);
   }
   return value;
+}
+
+function withJobControlPlaneMeta(params, meta) {
+  const next = { ...params };
+  const currentMeta = requireObject(next._control_plane ?? {}, "_control_plane");
+  next._control_plane = {
+    ...currentMeta,
+    ...meta,
+  };
+  return next;
+}
+
+function jobMaxAttempts(value) {
+  const parsed = parseJson(value);
+  const fromMeta = parsed && typeof parsed === "object" ? parsed._control_plane : null;
+  return clampInteger(fromMeta?.max_attempts, 1, 20, DEFAULT_JOB_MAX_ATTEMPTS);
 }
 
 function requiredToken(value, fieldName, maxLength = 64) {

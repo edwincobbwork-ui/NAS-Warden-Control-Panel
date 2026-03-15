@@ -58,6 +58,7 @@ This Worker accepts those contracts and persists them in D1.
   - accepts `completed`, `failed`, `cancelled`, or `retry_wait`
   - verifies the reporting NAS still owns the lease
   - clears or defers the lease and writes `job_events`
+  - can move a job to `dead_letter` when retry budget is exhausted
 
 ### Admin API routes
 
@@ -65,6 +66,7 @@ This Worker accepts those contracts and persists them in D1.
 - `POST /api/jobs`
 - `GET /api/jobs`
 - `GET /api/jobs/:jobId`
+- `POST /api/jobs/:jobId/requeue`
 - `GET /api/approvals`
 - `POST /api/approvals/:approvalId/approve`
 - `POST /api/approvals/:approvalId/deny`
@@ -77,8 +79,14 @@ Current safe write path:
 
 - `POST /api/jobs`
   - creates a queued job
+  - stores `max_attempts` retry metadata
   - optionally creates a pending approval request
   - writes initial `job_events`
+
+- `POST /api/jobs/:jobId/requeue`
+  - clears terminal error fields and lease state
+  - resets `attempt_count` by default
+  - returns the job to `queued`
 
 Example request body:
 
@@ -88,6 +96,7 @@ Example request body:
   "workspace_slug": "production",
   "requested_by": "admin-api",
   "priority": 100,
+  "max_attempts": 3,
   "requires_approval": true,
   "approval_reason": "Validate the approval gate before first real queue use.",
   "target_path": "validation/noop.txt",
@@ -101,6 +110,7 @@ Useful follow-up reads:
 
 - `GET /api/jobs`
 - `GET /api/approvals?status=pending`
+- `POST /api/jobs/:jobId/requeue`
 
 Heartbeat freshness defaults are now tuned for the current NAS cadence:
 
@@ -151,7 +161,6 @@ Current intentional simplifications:
 - no browser auth or UI yet
 - no upload-intent endpoint yet
 - no write-side admin UI yet
-- no queue dead-letter handling yet
 - job leasing is optimistic rather than full transactionally locked orchestration
 
 Those are acceptable for the current milestone because the goal here is to establish:
@@ -161,6 +170,7 @@ Those are acceptable for the current milestone because the goal here is to estab
 - the node heartbeat path
 - the claimable-job API shape
 - the leased-job completion / retry contract
+- the retry-budget / dead-letter contract
 
 ## Expected Next Step
 
@@ -169,4 +179,4 @@ The next implementation step should be one of:
 - add `POST /api/uploads/create` and `POST /api/uploads/complete`
 - add `POST /api/archive/create`
 - add a small admin front end on top of the existing routes
-- add queue dead-letter or retry budget handling
+- add a real job runner for non-`noop` work
